@@ -1,4 +1,6 @@
 This is a web application written using the Phoenix web framework.
+The application is a Virtual Manager for libvirt endpoints. You can find information about the architecture in the document SVMM_ARCHITECTURE.md
+
 
 ## Project guidelines
 

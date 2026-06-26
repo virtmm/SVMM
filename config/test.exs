@@ -20,3 +20,6 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+config :svmm,
+  ekv_data_dir: Path.join(System.tmp_dir!(), "svmm_test_ekv")

@@ -4,7 +4,7 @@ defmodule Svmm.MixProject do
   def project do
     [
       app: :svmm,
-      version: "0.1.0",
+      version: "0.3.0",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
@@ -34,10 +34,15 @@ defmodule Svmm.MixProject do
   # Specifies your project dependencies.
   #
   # Type `mix help deps` for examples and options.
+  # Durable server is a GenServer wrapper that persists state to a backend (EKV). Allows you to define services that need to be running in one server or another.
+  # EKV is an embedded key-value store backed by SQLite, with support for distributed duplication and clustering. It supports sharding, observer mode for replicas, and region-based routing
+
   defp deps do
     [
-      {:dns_cluster, "~> 0.2.0"},
-      {:phoenix_pubsub, "~> 2.1"}
+      {:libcluster, "~> 3.4"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:durable_server, "~> 0.1.4"},
+      {:ekv, "~> 0.4.0"}
     ]
   end
 

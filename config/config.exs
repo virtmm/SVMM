@@ -21,7 +21,7 @@ config :svmm_web, SvmmWeb.Endpoint,
     layout: false
   ],
   pubsub_server: Svmm.PubSub,
-  live_view: [signing_salt: "0VVRgqp6"]
+  live_view: [signing_salt: "BOWJAUmD8lJXggG52ulMQLeTloitcfqI"]
 
 # Configure esbuild (the version is required)
 config :esbuild,

@@ -7,13 +7,18 @@ defmodule SvmmWeb.Application do
 
   @impl true
   def start(_type, _args) do
-    children = [
-      SvmmWeb.Telemetry,
-      # Start a worker by calling: SvmmWeb.Worker.start_link(arg)
-      # {SvmmWeb.Worker, arg},
-      # Start to serve requests, typically the last entry
-      SvmmWeb.Endpoint
-    ]
+    config = Svmm.Config.load()
+
+    # Only start the Endpoint and Telemetry if this node is acting as a primary
+    children =
+      if Svmm.Config.node_role(config) == :primary do
+        [
+          SvmmWeb.Telemetry,
+          SvmmWeb.Endpoint
+        ]
+      else
+        []
+      end
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options

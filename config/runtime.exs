@@ -23,7 +23,11 @@ if config_env() == :prod do
       You can generate one by calling: mix phx.gen.secret
       """
 
+      # Make it possiblle to configure the cluster and the host in an HA environment, using DNS records.
+  host = System.get_env("PHX_HOST") || System.get_env("DNS_CLUSTER_QUERY") || "localhost"
+
   config :svmm_web, SvmmWeb.Endpoint,
+    # TODO: look at notes to force HTTPS.
     http: [
       # Enable IPv6 and bind on all interfaces.
       # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
@@ -74,4 +78,22 @@ if config_env() == :prod do
   # Check `Plug.SSL` for all available options in `force_ssl`.
 
   config :svmm, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
+
+  # Node configuration - also read from svmm.conf
+  # Only set if the env var is present, to avoid overwriting compile-time config (e.g. test)
+
+  for {env_key, app_key} <- [
+        # :primary or :replica
+        {"NODE_ROLE", :node_role},
+        # :long node name for distributed Erlang
+        {"NODE_NAME", :node_name},
+        # Required to communicate BEAM instances
+        {"ERLANG_COOKIE", :erlang_cookie},
+        # Path to the directory where the EKV database is stored
+        {"EKV_DATA_DIR", :ekv_data_dir}
+      ] do
+    if value = System.get_env(env_key) do
+      config :svmm, [{app_key, value}]
+    end
+  end
 end
