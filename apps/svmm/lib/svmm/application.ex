@@ -46,14 +46,19 @@ defmodule Svmm.Application do
   end
 
   defp start_primary_services do
-    {:ok, _} =
-      DurableServer.Supervisor.ensure_started_child(
-        Svmm.DurableServer.Supervisor,
-        {Svmm.Hosts, key: Svmm.Hosts.topic(), initial_state: %{hosts: []}}
-      )
+    case DurableServer.Supervisor.ensure_started_child(
+           Svmm.DurableServer.Supervisor,
+           {Svmm.Hosts, key: Svmm.Hosts.topic(), initial_state: %{hosts: []}}
+         ) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to start Svmm.Hosts durable server: #{inspect(reason)}")
+        :error
+    end
   end
 
-  @doc false
   defp setup_distribution(config) do
     node_name = Svmm.Config.node_name(config)
     cookie = Svmm.Config.cookie(config)
@@ -69,15 +74,19 @@ defmodule Svmm.Application do
         {:error, reason} ->
           raise "Failed to start node: #{inspect(reason)}"
       end
+    end
 
-      if cookie do
-        Node.set_cookie(cookie)
-        Logger.debug("Node cookie set to #{cookie}")
-      end
+    # Set the cookie whenever one is configured and the node is distributed,
+    # even when the BEAM was started already-alive (e.g. `iex --name ...`).
+    # Otherwise the configured ERLANG_COOKIE is silently ignored and clustering
+    # falls back to ~/.erlang.cookie.
+    if cookie && Node.alive?() do
+      Node.set_cookie(cookie)
+      Logger.debug("Node cookie set to #{cookie}")
     end
   end
 
-  @doc false
+  @spec children_for_role(map()) :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children_for_role(config) do
     role = Svmm.Config.node_role(config)
 
@@ -121,15 +130,18 @@ defmodule Svmm.Application do
     end
   end
 
-  @doc false
+  @spec verify_no_existing_primary(map()) :: :ok
   def verify_no_existing_primary(config) do
     primary_address = Svmm.Config.primary_address(config)
-    node_name = Svmm.Config.node_name(config) || Node.self()
 
+    # Exclude *this* running node, not the operator-declared NODE_NAME. In the
+    # documented HA setup NODE_NAME is `primary@<DNS_CLUSTER_QUERY>`, which is
+    # exactly the name we build below, so comparing against the configured name
+    # always matched and skipped the ping — letting a second primary boot.
     with true <- primary_address != nil,
          true <- Node.alive?(),
          primary_node = :"primary@#{primary_address}",
-         true <- primary_node != node_name,
+         true <- primary_node != Node.self(),
          :pong <- :net_adm.ping(primary_node) do
       raise """
       Another primary is already running at #{primary_node}.

@@ -41,11 +41,13 @@ defmodule Svmm.Config do
           %{}
       end
 
+    # Precedence (highest first), matching the moduledoc: application
+    # environment, then OS environment variables, then the config file.
     Map.new(@keys, fn {env_key, app_key} ->
       value =
-        Map.get(file_config, env_key) ||
+        app_env_as_string(app_key) ||
           System.get_env(env_key) ||
-          app_env_as_string(app_key)
+          Map.get(file_config, env_key)
 
       {env_key, value}
     end)
@@ -63,8 +65,11 @@ defmodule Svmm.Config do
   @spec node_role(%{String.t() => String.t() | nil}) :: :primary | :replica
   def node_role(config) do
     case config["NODE_ROLE"] do
-      "replica" -> :replica
-      _ -> :primary
+      role when is_binary(role) ->
+        if String.downcase(String.trim(role)) == "replica", do: :replica, else: :primary
+
+      _ ->
+        :primary
     end
   end
 

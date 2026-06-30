@@ -452,14 +452,16 @@ EKV is an embedded distributed key-value store backed by SQLite.
 - **Member mode**: Full read/write (primary)
 - **Observer mode**: Read-only replica that receives writes from the primary via Erlang distribution
 
-The EKV instance is registered as `:svmm_cluster` on all nodes. The `data_dir` must be different per node so they don't write to the same SQLite files.
+The EKV instance is registered as `:svmm_cluster` on all nodes. **Both primary and replica use the same default `EKV_DATA_DIR`.** In production, each node runs on a separate host so the same path (e.g. `./data/ekv_store`) points to a different filesystem. This makes promotion zero-effort: a replica restarted as primary already has the replicated data at the expected path. The only structural difference between roles is the `mode` option passed to EKV.
+
+The local dev scripts use different directories (`ekv_store` vs `replica_ekv_store`) solely to avoid file conflicts when running two BEAM nodes on the same machine.
 
 ### Primary EKV config
 
 ```elixir
 [
   name: :svmm_cluster,
-  data_dir: "./data/ekv_store",
+  data_dir: "./data/ekv_store",   # same default path on every node
   cluster_size: 1,
   shards: 2
 ]
@@ -470,7 +472,7 @@ The EKV instance is registered as `:svmm_cluster` on all nodes. The `data_dir` m
 ```elixir
 [
   name: :svmm_cluster,
-  data_dir: "./data/replica_ekv_store",
+  data_dir: "./data/ekv_store",   # same path — different filesystem in production
   cluster_size: 1,
   shards: 2,
   mode: :observer,
@@ -631,7 +633,9 @@ SvmmWeb.Supervisor (one_for_one)
 
 ## 11. Scripts (`scripts/`)
 
-All scripts use `SCRIPT_DIR` for portable relative paths.
+All scripts use `SCRIPT_DIR` for portable relative paths. The dev cookie defaults to `svmm_dev`.
+
+> **Note on EKV directories in these scripts:** In production each node is on a separate host, so primary and replica both use the same default path (`./data/ekv_store`). These scripts run two nodes on the same machine, so they use different directories to avoid SQLite file conflicts. That is the only reason the paths differ.
 
 ### `scripts/PRIMARY.sh`
 
@@ -656,7 +660,7 @@ SCRIPT_DIR=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
 
 export NODE_NAME="replica@127.0.0.1"
 export PORT="4001"
-export EKV_DATA_DIR="$SCRIPT_DIR/../data/replica_ekv_store"
+export EKV_DATA_DIR="$SCRIPT_DIR/../data/replica_ekv_store"   # different dir: same-machine workaround
 export NODE_ROLE="replica"
 export ERLANG_COOKIE="${ERLANG_COOKIE:-svmm_dev}"
 export DNS_CLUSTER_QUERY="${DNS_CLUSTER_QUERY:-127.0.0.1}"
@@ -664,7 +668,7 @@ export DNS_CLUSTER_QUERY="${DNS_CLUSTER_QUERY:-127.0.0.1}"
 iex --name "$NODE_NAME" -S mix phx.server "$@"
 ```
 
-### `scripts/REPLICA_AS_PRIMARY.sh` (failover)
+### `scripts/REPLICA_AS_PRIMARY.sh` (local failover simulation)
 
 ```bash
 #!/usr/bin/env bash
@@ -672,7 +676,7 @@ SCRIPT_DIR=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
 
 export NODE_NAME="primary@127.0.0.1"
 export PORT="4002"
-export EKV_DATA_DIR="$SCRIPT_DIR/../data/replica_ekv_store"
+export EKV_DATA_DIR="$SCRIPT_DIR/../data/replica_ekv_store"   # points at replica's data dir
 export NODE_ROLE="primary"
 export ERLANG_COOKIE="${ERLANG_COOKIE:-svmm_dev}"
 export DNS_CLUSTER_QUERY="${DNS_CLUSTER_QUERY:-127.0.0.1}"
@@ -680,11 +684,11 @@ export DNS_CLUSTER_QUERY="${DNS_CLUSTER_QUERY:-127.0.0.1}"
 iex --name "$NODE_NAME" -S mix phx.server "$@"
 ```
 
-Promotes a replica to primary by using the replica's EKV data directory in primary mode.
+Simulates promoting a replica to primary on a single machine. In production, promotion is simply restarting the replica process with `NODE_ROLE=primary` — no data movement needed because the EKV path is already the same on every host.
 
 ### `scripts/CLEAN_STORAGE.sh`
 
-Deletes both EKV data directories. Run between test sessions to start clean.
+Deletes both local test EKV data directories. Run between test sessions to start clean.
 
 Make scripts executable: `chmod +x scripts/*.sh`
 
@@ -736,6 +740,8 @@ curl http://localhost:4001   # => connection refused
 ./scripts/REPLICA_AS_PRIMARY.sh
 ```
 
+This script reads from the replica's separate local data dir (`data/replica_ekv_store`). In production on separate hosts, you would just restart the replica process with `NODE_ROLE=primary` — no data movement needed.
+
 Verify data is intact and web UI available:
 
 ```elixir
@@ -765,7 +771,7 @@ DNS_CLUSTER_QUERY=127.0.0.1
 ```
 
 ```
-# replica.conf
+# replica.conf  (local testing — different EKV dir only because both nodes share the same machine)
 NODE_NAME=replica@127.0.0.1
 NODE_ROLE=replica
 ERLANG_COOKIE=svmm_dev
@@ -773,6 +779,8 @@ EKV_DATA_DIR=data/replica_ekv_store
 DNS_CLUSTER_QUERY=127.0.0.1
 PORT=4001
 ```
+
+In production the `EKV_DATA_DIR` line is omitted and defaults to `./data/ekv_store` on every host.
 
 Copy or symlink to `./svmm.conf` before running. Environment variables override the file.
 
@@ -903,3 +911,142 @@ Replicas are always headless by design (`SvmmWeb.Application` starts no children
 5. Broadcast changes via `Phoenix.PubSub` from within callbacks so LiveViews can react
 
 See `Svmm.Hosts` as the reference implementation.
+
+---
+
+## 20. Authentication
+
+See [`docs/Authentication.md`](../docs/Authentication.md) for the full design. This section covers the implementation structure within the umbrella.
+
+### Auth behaviour (`apps/svmm/lib/svmm/auth.ex`)
+
+```elixir
+defmodule Svmm.Auth do
+  @callback authenticate(credentials :: map()) :: {:ok, user :: map()} | {:error, atom()}
+  @callback verify_agent_token(token :: String.t()) :: {:ok, agent_id :: String.t()} | :error
+
+  def authenticate(credentials), do: backend().authenticate(credentials)
+  def verify_agent_token(token), do: backend().verify_agent_token(token)
+  defp backend, do: Application.get_env(:svmm, :auth_backend, Svmm.Auth.EKVBackend)
+end
+```
+
+### EKV backend (`apps/svmm/lib/svmm/auth/ekv_backend.ex`)
+
+Implements `Svmm.Auth`. Stores credentials in EKV under the `svmm/auth/` prefix.
+
+EKV keys:
+
+- `svmm/auth/users/<username>` → `%{password_hash: ..., roles: [...], created_at: ...}`
+- `svmm/auth/agents/<agent_id>` → `%{token_hash: ..., created_at: ...}`
+
+Exposes `bootstrap/0`, called from `start_primary_services/0`. It writes the initial admin password from `SVMM_ADMIN_PASSWORD` to EKV if no credentials exist yet. Bootstrap runs only on the primary; credentials replicate to replicas automatically via EKV observer mode.
+
+### OIDC backend (`apps/svmm/lib/svmm/auth/oidc_backend.ex`)
+
+Delegates user authentication to an external IdP. Agent token validation continues to use EKV. Enabled via `AUTH_BACKEND=oidc` in config/env.
+
+### Session tokens
+
+On successful user login, `SvmmWeb.Auth` issues a JWT signed with `SECRET_KEY_BASE`. Stored client-side (HttpOnly cookie). No server-side session storage required.
+
+### Wiring bootstrap into `start_primary_services/0`
+
+```elixir
+defp start_primary_services do
+  {:ok, _} =
+    DurableServer.Supervisor.ensure_started_child(
+      Svmm.DurableServer.Supervisor,
+      {Svmm.Hosts, key: Svmm.Hosts.topic(), initial_state: %{hosts: []}}
+    )
+
+  :ok = Svmm.Auth.EKVBackend.bootstrap()
+end
+```
+
+---
+
+## 21. Agent Communication (Phoenix Channels)
+
+SVMM communicates with Go agents via Phoenix Channels over WebSocket. No message broker is required.
+
+### Socket endpoint
+
+Add to `apps/svmm_web/lib/svmm_web/endpoint.ex`:
+
+```elixir
+socket "/agent/socket", SvmmWeb.AgentSocket,
+  websocket: [check_origin: false],
+  longpoll: false
+```
+
+### `SvmmWeb.AgentSocket` (`apps/svmm_web/lib/svmm_web/agent_socket.ex`)
+
+```elixir
+defmodule SvmmWeb.AgentSocket do
+  use Phoenix.Socket
+  channel "host:*", SvmmWeb.AgentChannel
+
+  @impl true
+  def connect(%{"token" => token}, socket, _info) do
+    case Svmm.Auth.verify_agent_token(token) do
+      {:ok, agent_id} -> {:ok, assign(socket, :agent_id, agent_id)}
+      :error -> :error
+    end
+  end
+
+  @impl true
+  def id(socket), do: "agent_socket:#{socket.assigns.agent_id}"
+end
+```
+
+### `SvmmWeb.AgentChannel` (`apps/svmm_web/lib/svmm_web/agent_channel.ex`)
+
+```elixir
+defmodule SvmmWeb.AgentChannel do
+  use Phoenix.Channel
+
+  def join("host:" <> agent_id, _params, socket) do
+    {:ok, assign(socket, :agent_id, agent_id)}
+  end
+
+  def handle_in("registration", payload, socket) do
+    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:registration, socket.assigns.agent_id, payload})
+    {:noreply, socket}
+  end
+
+  def handle_in("heartbeat", payload, socket) do
+    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:heartbeat, socket.assigns.agent_id, payload})
+    {:noreply, socket}
+  end
+
+  def handle_in("status", payload, socket) do
+    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:status, socket.assigns.agent_id, payload})
+    {:noreply, socket}
+  end
+
+  @doc "Called from domain logic to send a command to a specific agent."
+  def send_command(agent_id, action, params \\ %{}) do
+    SvmmWeb.Endpoint.broadcast("host:#{agent_id}", "command", %{action: action, params: params})
+  end
+end
+```
+
+### Event reference
+
+| Direction | Event | Key payload fields |
+|---|---|---|
+| Agent → SVMM | `registration` | `agent_id`, `connection_type` (`"system"` \| `"user"`), `user` (user mode only) |
+| Agent → SVMM | `heartbeat` | `agent_id`, `timestamp` |
+| Agent → SVMM | `status` | `agent_id`, `vms`, `networks`, `node` |
+| SVMM → Agent | `command` | `action` (`"start_vm"` \| `"stop_vm"` \| `"full_refresh"`), `params` |
+
+See `amqp-libvirt-bridge/PROTOCOL.md` for full message formats including status diff structure.
+
+### PubSub integration
+
+Domain modules (e.g. `Svmm.Hosts`) subscribe to the `"agents"` PubSub topic to drive reconciliation. LiveViews also subscribe to broadcast real-time updates to the UI without coupling to the channel.
+
+### Supervisor note
+
+No extra supervisor child is needed. Phoenix Channels are managed entirely by `SvmmWeb.Endpoint`.
