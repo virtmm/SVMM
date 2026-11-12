@@ -1,7 +1,15 @@
 defmodule Svmm.ClusterTest do
   use ExUnit.Case, async: false
 
-  @peer_opts %{connection: :standard, host: ~c"127.0.0.1", longnames: true}
+  # wait_boot: booting a peer BEAM can exceed the 15s default on a loaded machine.
+  # shutdown: :halt skips the graceful-disconnect wait that otherwise costs ~10s per stop.
+  @peer_opts %{
+    connection: :standard,
+    host: ~c"127.0.0.1",
+    longnames: true,
+    wait_boot: 60_000,
+    shutdown: :halt
+  }
 
   defp start_peer(name) do
     cookie = Node.get_cookie() |> Atom.to_charlist()
@@ -12,13 +20,19 @@ defmodule Svmm.ClusterTest do
     {pid, node}
   end
 
-  defp stop_peer(pid) do
+  # Drop our distribution link first, otherwise :peer.stop/1 waits ~10s for the
+  # disconnect before forcing it. The peer is controlled over that link, so it
+  # may already be gone by the time we call stop.
+  defp stop_peer({pid, node}) do
+    Node.disconnect(node)
     :peer.stop(pid)
+  catch
+    :exit, _ -> :ok
   end
 
   describe "primary safety check" do
     test "raises when another primary responds on the same host" do
-      {peer, _node} = start_peer(:primary)
+      peer = start_peer(:primary)
 
       on_exit(fn -> stop_peer(peer) end)
 

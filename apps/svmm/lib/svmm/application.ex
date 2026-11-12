@@ -45,6 +45,9 @@ defmodule Svmm.Application do
     end
   end
 
+  # A primary without its domain servers cannot do its job (and would serve the
+  # web UI over missing state), so a failure here aborts boot instead of being
+  # logged and ignored.
   defp start_primary_services do
     case DurableServer.Supervisor.ensure_started_child(
            Svmm.DurableServer.Supervisor,
@@ -54,8 +57,7 @@ defmodule Svmm.Application do
         :ok
 
       {:error, reason} ->
-        Logger.error("Failed to start Svmm.Hosts durable server: #{inspect(reason)}")
-        :error
+        raise "Failed to start Svmm.Hosts durable server: #{inspect(reason)}"
     end
   end
 

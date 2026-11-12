@@ -221,15 +221,17 @@ end
 
 ## 4. Configuration Module (`Svmm.Config`)
 
-Reads from `./svmm.conf` or `/etc/svmm.conf` (dotenv-style), falling back to environment variables and then `Application.get_env/2`.
+Reads from `./svmm.conf` or `/etc/svmm.conf` (dotenv-style) and merges it with environment variables and `Application.get_env/2`.
 
 **Configuration priority (highest to lowest):**
 
 ```
-svmm.conf file > environment variables > Application.get_env(:svmm, key)
+Application.get_env(:svmm, key) > environment variables > svmm.conf file
 ```
 
 The file can also be used as a systemd `EnvironmentFile`.
+
+The file is the lowest-priority source so that an operator can override any value for a single run with an environment variable. In `prod`, `config/runtime.exs` copies `NODE_ROLE`, `NODE_NAME`, `ERLANG_COOKIE` and `EKV_DATA_DIR` env vars into the application environment, so those take effect through the highest-priority source.
 
 ### Environment variables reference
 
@@ -343,7 +345,7 @@ defp start_primary_services do
 end
 ```
 
-This starts all domain DurableServer children (e.g. `Svmm.Hosts`). This two-phase approach (supervisor first, then `ensure_started_child`) is required because DurableServer children need the supervisor and EKV to be running first.
+This starts all domain DurableServer children (e.g. `Svmm.Hosts`). A failure to start any of them raises and aborts boot, so a primary never serves requests with missing domain servers. This two-phase approach (supervisor first, then `ensure_started_child`) is required because DurableServer children need the supervisor and EKV to be running first.
 
 ### libcluster topology
 
@@ -628,6 +630,20 @@ SvmmWeb.Supervisor (one_for_one)
 3. `Cluster.Strategy.Epmd` on the replica connects to `primary@<primary_IP>`
 4. Once Erlang distribution connects the nodes, EKV observer mode automatically receives writes from the primary EKV member
 5. `verify_no_existing_primary/1` on the primary prevents split-brain
+
+### 10.1 Failover model: manual, by design
+
+SVMM deliberately has **no automatic failover, quorum or leader election**. A customer runs one main server (primary) plus any number of replicas that hold a copy of the data. If the primary fails, the operator decides to promote a replica and starts it by hand with `NODE_ROLE=primary`.
+
+Consequences:
+
+- Replicas are cold standbys: headless, read-only EKV observers. Their only job is to keep a current copy of the state.
+- Promotion is a restart with a different role. No data movement is needed because the replica's EKV directory already has the data.
+- The operator is responsible for making sure the old primary is really down before promoting. `verify_no_existing_primary/1` is a safety net for that: it refuses to boot a second primary if one is reachable over Erlang distribution. It cannot detect a primary that is alive but partitioned away, and that case is left to the operator.
+- The old primary must not be restarted as a primary after a promotion. Bring it back as a replica.
+- Anything that depends on a replica being current (promotion runbook, UI) should show how fresh the copy is, because the operator decides based on it. This is not built yet.
+
+The "relinquish the lead on quorum loss" wording in the parent `ARCHITECTURE.md` (§5) and the quorum/leader-election items in the root `AGENTS.md` do not apply to this model.
 
 ---
 
@@ -966,13 +982,107 @@ end
 
 ---
 
-## 21. Agent Communication (Phoenix Channels)
+## 21. Agent Communication (transport-agnostic, WebSocket first)
 
-SVMM communicates with Go agents via Phoenix Channels over WebSocket. No message broker is required.
+SVMM talks to Go agents over a **transport-agnostic boundary** (ports & adapters).
+The default adapter is **Phoenix Channels over WebSocket** — no message broker
+required. A future **AMQP adapter** can be dropped in by config, without touching
+the domain or adding an `amqp` dependency to the core.
 
-### Socket endpoint
+### 21.1 Guiding principles
 
-Add to `apps/svmm_web/lib/svmm_web/endpoint.ex`:
+- **Core owns contracts, not transports.** `apps/svmm` depends on neither Phoenix
+  (web) nor `amqp`. It ships a behaviour + canonical structs; every transport is an
+  adapter that depends *on* the core, never the reverse.
+- **Fire-and-forget is acceptable.** Commands and events may be lost on disconnect
+  (at-most-once). No durable queue is built on the WebSocket path.
+- **Two symmetric pipelines.** The inbound (agent → state/UI) path and the outbound
+  (intent → command → agent) path both cross the same transport boundary, so a new
+  transport lights up both directions at once.
+- **Independent of the external Commanded/AMQP system.** SVMM never imports
+  `commanded`. Integration happens later through an anti-corruption layer in its own
+  app that maps the external system's events onto `Svmm.Agents` intents.
+
+### 21.2 Tiers
+
+```
+API tier         apps/svmm_web  — REST/JSON + GraphQL controllers, LiveView UI
+                      │ Svmm.Agents.command/2 (intent)        ▲ subscribes Svmm.PubSub
+DECISION tier    apps/svmm      — Svmm.Orchestrator, Svmm.Hosts/DurableServer (EKV)
+                      │ Svmm.Agents.Transport (behaviour)     ▲ Svmm.Agents.Ingress
+EDGE/TRANSPORT   adapter apps   — WebSocket now (svmm_web); AMQP later (svmm_amqp)
+                      ▲ WSS/443                               ▲ AMQPS/5671 (future)
+                                        Go agents
+```
+
+Tiers are separate umbrella apps communicating through `Svmm.PubSub` and the
+transport behaviour, so the **API tier** and **decision tier** can later be split
+onto different libcluster nodes without code change (the role-aware
+`SvmmWeb.Application` is the seam).
+
+### 21.3 Core contracts (`apps/svmm`, no transport deps)
+
+Canonical structs — the internal representation, independent of any wire format.
+Every adapter marshals JSON/AMQP payloads to/from these; the domain never sees a
+wire format.
+
+```elixir
+# apps/svmm/lib/svmm/agents/command.ex   (server → agent, outbound)
+defmodule Svmm.Agents.Command do
+  @enforce_keys [:action]
+  defstruct [:action, params: %{}, id: nil]   # action: :start_vm | :stop_vm | :full_refresh
+  @type t :: %__MODULE__{action: atom(), params: map(), id: String.t() | nil}
+end
+
+# apps/svmm/lib/svmm/agents/event.ex      (agent → server, inbound, normalized)
+defmodule Svmm.Agents.Event do
+  @enforce_keys [:kind, :agent_id]
+  defstruct [:kind, :agent_id, payload: %{}, received_at: nil]  # kind: :registration | :heartbeat | :status
+  @type t :: %__MODULE__{kind: atom(), agent_id: String.t(), payload: map(), received_at: DateTime.t() | nil}
+end
+```
+
+The outbound **port** (behaviour) — the only thing the decision tier knows about
+transport. Runtime dispatch via config avoids a compile-time core→adapter dep.
+
+```elixir
+# apps/svmm/lib/svmm/agents/transport.ex
+defmodule Svmm.Agents.Transport do
+  @callback send_command(agent_id :: String.t(), Svmm.Agents.Command.t()) :: :ok | {:error, term()}
+  @callback connected?(agent_id :: String.t()) :: boolean()
+
+  def impl, do: Application.fetch_env!(:svmm, :agent_transport)
+  def send_command(agent_id, cmd), do: impl().send_command(agent_id, cmd)
+  def connected?(agent_id), do: impl().connected?(agent_id)
+end
+```
+
+The inbound **funnel** — a single door every adapter calls, so decision logic has
+one entry point regardless of wire. (`Phoenix.PubSub` is a standalone lib, not the
+web framework, so it is fine in core.)
+
+```elixir
+# apps/svmm/lib/svmm/agents/ingress.ex
+defmodule Svmm.Agents.Ingress do
+  @spec handle(Svmm.Agents.Event.t()) :: :ok
+  def handle(%Svmm.Agents.Event{} = ev) do
+    Svmm.Agents.Registry.touch(ev.agent_id)               # liveness, transport-agnostic
+    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", ev)   # domain + LiveViews react
+  end
+end
+```
+
+Supporting core modules:
+- `Svmm.Agents` — context facade; `command(agent_id, action, params)` builds a
+  `%Command{}` and calls `Transport.send_command/2`. Public API for the API tier and orchestrator.
+- `Svmm.Agents.Registry` — transport-agnostic agent liveness (who is connected /
+  last seen), so the domain never queries `Presence` directly.
+- `Svmm.Orchestrator` — decision tier: consumes the `"agents"` PubSub topic, decides,
+  emits commands through the port.
+
+### 21.4 WebSocket adapter (now, `apps/svmm_web`)
+
+Endpoint socket:
 
 ```elixir
 socket "/agent/socket", SvmmWeb.AgentSocket,
@@ -980,7 +1090,7 @@ socket "/agent/socket", SvmmWeb.AgentSocket,
   longpoll: false
 ```
 
-### `SvmmWeb.AgentSocket` (`apps/svmm_web/lib/svmm_web/agent_socket.ex`)
+Auth stays in `SvmmWeb.AgentSocket` (token via `Svmm.Auth.verify_agent_token/1`):
 
 ```elixir
 defmodule SvmmWeb.AgentSocket do
@@ -1000,53 +1110,104 @@ defmodule SvmmWeb.AgentSocket do
 end
 ```
 
-### `SvmmWeb.AgentChannel` (`apps/svmm_web/lib/svmm_web/agent_channel.ex`)
+`SvmmWeb.AgentChannel` is **thin** — it only marshals JSON → `%Event{}` and delegates
+to the core funnel; no domain logic lives here:
 
 ```elixir
 defmodule SvmmWeb.AgentChannel do
   use Phoenix.Channel
+  alias Svmm.Agents.{Event, Ingress}
 
   def join("host:" <> agent_id, _params, socket) do
     {:ok, assign(socket, :agent_id, agent_id)}
   end
 
-  def handle_in("registration", payload, socket) do
-    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:registration, socket.assigns.agent_id, payload})
+  def handle_in(kind, payload, socket) when kind in ~w(registration heartbeat status) do
+    Ingress.handle(%Event{
+      kind: String.to_existing_atom(kind),
+      agent_id: socket.assigns.agent_id,
+      payload: payload,
+      received_at: DateTime.utc_now()
+    })
     {:noreply, socket}
-  end
-
-  def handle_in("heartbeat", payload, socket) do
-    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:heartbeat, socket.assigns.agent_id, payload})
-    {:noreply, socket}
-  end
-
-  def handle_in("status", payload, socket) do
-    Phoenix.PubSub.broadcast(Svmm.PubSub, "agents", {:status, socket.assigns.agent_id, payload})
-    {:noreply, socket}
-  end
-
-  @doc "Called from domain logic to send a command to a specific agent."
-  def send_command(agent_id, action, params \\ %{}) do
-    SvmmWeb.Endpoint.broadcast("host:#{agent_id}", "command", %{action: action, params: params})
   end
 end
 ```
 
-### Event reference
+Outbound adapter implements the behaviour:
 
-| Direction | Event | Key payload fields |
+```elixir
+# apps/svmm_web/lib/svmm_web/agent_transport.ex
+defmodule SvmmWeb.AgentTransport do
+  @behaviour Svmm.Agents.Transport
+
+  @impl true
+  def send_command(agent_id, %Svmm.Agents.Command{} = c),
+    do: SvmmWeb.Endpoint.broadcast("host:#{agent_id}", "command", to_wire(c))
+
+  @impl true
+  def connected?(agent_id), do: SvmmWeb.Presence.get_by_key("agents", agent_id) != []
+
+  defp to_wire(%{action: a, params: p}), do: %{action: Atom.to_string(a), params: p}
+end
+```
+
+Wiring:
+
+```elixir
+# config/config.exs
+config :svmm, :agent_transport, SvmmWeb.AgentTransport
+```
+
+No extra supervisor child is needed on this path — Phoenix Channels are managed by
+`SvmmWeb.Endpoint`.
+
+### 21.5 AMQP adapter (future, `apps/svmm_amqp`)
+
+Delivered as a **separate umbrella app** so `apps/svmm` never gains an `amqp`
+dependency. It provides:
+- `Svmm.Amqp.Consumer` — a `Broadway`/`amqp` consumer that marshals AMQP messages →
+  `%Event{}` → `Svmm.Agents.Ingress.handle/1` (same funnel as WebSocket).
+- `Svmm.Amqp.Transport` — implements `Svmm.Agents.Transport`, publishing `%Command{}`
+  to an exchange.
+
+Switching transports is then: add the app to the umbrella and flip one line —
+
+```elixir
+config :svmm, :agent_transport, Svmm.Amqp.Transport
+```
+
+Liveness on the AMQP path is heartbeat/TTL based via `Svmm.Agents.Registry` (no
+`Presence`), keeping the domain unchanged.
+
+### 21.6 External Commanded/AMQP integration (anti-corruption layer)
+
+When integrating the external system that uses Commanded + AMQP, add
+`apps/svmm_integration`. It translates *their* Commanded events / AMQP messages onto
+`Svmm.Agents.command/2` and reads SVMM's `"agents"` PubSub events back. SVMM core
+never imports `commanded`; the two systems meet only at this ACL, which can reuse the
+`apps/svmm_amqp` transport.
+
+### 21.7 Event reference
+
+| Direction | Event / `kind` | Key payload fields |
 |---|---|---|
 | Agent → SVMM | `registration` | `agent_id`, `connection_type` (`"system"` \| `"user"`), `user` (user mode only) |
 | Agent → SVMM | `heartbeat` | `agent_id`, `timestamp` |
 | Agent → SVMM | `status` | `agent_id`, `vms`, `networks`, `node` |
 | SVMM → Agent | `command` | `action` (`"start_vm"` \| `"stop_vm"` \| `"full_refresh"`), `params` |
 
-See `amqp-libvirt-bridge/PROTOCOL.md` for full message formats including status diff structure.
+See `amqp-libvirt-bridge/PROTOCOL.md` for full wire message formats including status
+diff structure.
 
-### PubSub integration
+### 21.8 Migration steps (each shippable)
 
-Domain modules (e.g. `Svmm.Hosts`) subscribe to the `"agents"` PubSub topic to drive reconciliation. LiveViews also subscribe to broadcast real-time updates to the UI without coupling to the channel.
-
-### Supervisor note
-
-No extra supervisor child is needed. Phoenix Channels are managed entirely by `SvmmWeb.Endpoint`.
+1. Add core contracts: `Command`, `Event`, `Transport` behaviour, `Ingress`,
+   `Registry`, `Agents` facade (pure extraction, no behaviour change).
+2. Refactor `AgentChannel` to marshal → `Ingress`; add `SvmmWeb.AgentTransport`;
+   wire config. WebSocket keeps working, now behind the port.
+3. Introduce `Svmm.Orchestrator` (decision tier) consuming `"agents"` PubSub,
+   emitting commands via the port.
+4. Add API-tier controllers calling `Svmm.Agents.command/2`.
+5. *(Future)* `apps/svmm_amqp` adapter — flip config to switch transports.
+6. *(Future)* `apps/svmm_integration` ACL for the external Commanded/AMQP system.
