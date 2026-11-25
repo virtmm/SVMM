@@ -55,6 +55,10 @@ config :phoenix, :json_library, Jason
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
+# Agent transport adapter (lives in the independent :svmm_grpc app). The core
+# defaults to Svmm.Agents.Transport.Noop when this is unset.
+config :svmm, :agent_transport, Svmm.Grpc.Transport
+
 import_config "#{config_env()}.exs"
 
 # Configure LiveView

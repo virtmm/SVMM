@@ -21,13 +21,24 @@ defmodule Svmm.Application do
       verify_no_existing_primary(config)
     end
 
-    children = children_for_role(config)
+    start_tree = fn ekv_overrides ->
+      config
+      |> children_for_role(ekv_overrides)
+      |> Supervisor.start_link(strategy: :one_for_one, name: Svmm.Supervisor)
+    end
 
-    {:ok, pid} = Supervisor.start_link(children, strategy: :one_for_one, name: Svmm.Supervisor)
+    # Recovers from EKV refusing stale on-disk data (see Svmm.StaleStartup).
+    case Svmm.StaleStartup.start(start_tree, config) do
+      {:ok, pid} ->
+        if role == :primary, do: start_primary_services()
+        {:ok, pid}
 
-    if role == :primary, do: start_primary_services()
+      {:error, {:stale_db_refused, message}} ->
+        raise message
 
-    {:ok, pid}
+      {:error, reason} ->
+        raise "Failed to start Svmm.Supervisor: #{inspect(reason)}"
+    end
   end
 
   defp topologies(config) do
@@ -88,18 +99,26 @@ defmodule Svmm.Application do
     end
   end
 
-  @spec children_for_role(map()) :: [Supervisor.child_spec() | {module(), term()} | module()]
-  def children_for_role(config) do
+  @doc """
+  Children of `Svmm.Supervisor` for this node's role. `ekv_overrides` are merged
+  into the EKV options (used by `Svmm.StaleStartup`, e.g. `allow_stale_startup: true`).
+  """
+  @spec children_for_role(map(), keyword()) ::
+          [Supervisor.child_spec() | {module(), term()} | module()]
+  def children_for_role(config, ekv_overrides \\ []) do
     role = Svmm.Config.node_role(config)
 
-    [
+    base_children = [
       {Cluster.Supervisor, [topologies(config), [name: Svmm.ClusterSupervisor]]},
-      {Phoenix.PubSub, name: Svmm.PubSub}
-    ] ++ role_children(role, config)
+      {Phoenix.PubSub, name: Svmm.PubSub},
+      {Svmm.Agents.Registry, []}
+    ]
+
+    base_children ++ role_children(role, config, ekv_overrides)
   end
 
-  defp role_children(:primary, config) do
-    ekv_config = ekv_config(config, :member)
+  defp role_children(:primary, config, ekv_overrides) do
+    ekv_config = ekv_config(config, :member, ekv_overrides)
 
     [
       {EKV, ekv_config},
@@ -110,15 +129,15 @@ defmodule Svmm.Application do
     ]
   end
 
-  defp role_children(:replica, config) do
-    ekv_config = ekv_config(config, :observer)
+  defp role_children(:replica, config, ekv_overrides) do
+    ekv_config = ekv_config(config, :observer, ekv_overrides)
 
     [
       {EKV, ekv_config}
     ]
   end
 
-  defp ekv_config(config, mode) do
+  defp ekv_config(config, mode, overrides) do
     base = [
       name: :svmm_cluster,
       data_dir: Svmm.Config.ekv_data_dir(config),
@@ -126,10 +145,13 @@ defmodule Svmm.Application do
       shards: Svmm.Config.ekv_shards(config)
     ]
 
-    case mode do
-      :member -> base
-      :observer -> base ++ [mode: :observer, region: "replica", region_routing: ["default"]]
-    end
+    role_opts =
+      case mode do
+        :member -> []
+        :observer -> [mode: :observer, region: "replica", region_routing: ["default"]]
+      end
+
+    Keyword.merge(base ++ role_opts, overrides)
   end
 
   @spec verify_no_existing_primary(map()) :: :ok

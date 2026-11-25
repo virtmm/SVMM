@@ -14,6 +14,7 @@ defmodule Svmm.Config do
 
   @default_shards 2
   @default_cluster_size 1
+  @default_grpc_port 50051
 
   @keys [
     {"NODE_NAME", :node_name},
@@ -22,7 +23,12 @@ defmodule Svmm.Config do
     {"EKV_DATA_DIR", :ekv_data_dir},
     {"DNS_CLUSTER_QUERY", :dns_cluster_query},
     {"CLUSTER_SIZE", :cluster_size},
-    {"EKV_SHARDS", :ekv_shards}
+    {"EKV_SHARDS", :ekv_shards},
+    {"GRPC_PORT", :grpc_port},
+    {"GRPC_ENABLED", :grpc_enabled},
+    # Operator decision when a multi-member primary finds stale EKV data at
+    # startup: "trust" or "wipe". Set for one start only. See Svmm.StaleStartup.
+    {"EKV_STALE_STARTUP", :ekv_stale_startup}
   ]
 
   @spec load() :: %{String.t() => String.t()}
@@ -118,6 +124,34 @@ defmodule Svmm.Config do
     else
       value when is_integer(value) -> value
       _ -> @default_shards
+    end
+  end
+
+  @spec grpc_port(%{String.t() => String.t() | nil}) :: integer()
+  def grpc_port(config) do
+    with value when is_binary(value) <- config["GRPC_PORT"],
+         {int_value, ""} <- Integer.parse(value) do
+      int_value
+    else
+      value when is_integer(value) -> value
+      _ -> @default_grpc_port
+    end
+  end
+
+  @spec grpc_enabled?(%{String.t() => String.t() | nil}) :: boolean()
+  def grpc_enabled?(config) do
+    case config["GRPC_ENABLED"] do
+      nil ->
+        true
+
+      val when is_boolean(val) ->
+        val
+
+      val when is_binary(val) ->
+        String.downcase(String.trim(val)) not in ["false", "0", "no"]
+
+      _ ->
+        true
     end
   end
 

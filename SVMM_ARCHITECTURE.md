@@ -10,7 +10,7 @@ SVMM (Simple Virtual Machine Manager) is an Elixir umbrella application that man
 mix phx.new svmm --umbrella --no-ecto --no-mailer --no-dashboard
 ```
 
-- `--umbrella`: creates `apps/svmm/` (core OTP app) and `apps/svmm_web/` (Phoenix web app)
+- `--umbrella`: creates `apps/svmm/` (core OTP app) and `apps/svmm_web/` (Phoenix web app). A third app, `apps/svmm_grpc/` (the agent transport adapter, section 21), was added afterwards.
 - `--no-ecto`: no database — persistence is handled by EKV (embedded key-value store backed by SQLite)
 - `--no-mailer`, `--no-dashboard`: not needed
 
@@ -19,6 +19,7 @@ svmm_umbrella/
   apps/
     svmm/           # core OTP logic, config, durable state, domain modules
     svmm_web/       # Phoenix endpoint, LiveView UI, router
+    svmm_grpc/      # gRPC agent transport adapter (independent OTP app, depends on svmm)
   config/           # shared config (config.exs, dev.exs, test.exs, runtime.exs, prod.exs)
   mix.exs           # umbrella root
   scripts/          # dev/ops scripts
@@ -42,11 +43,32 @@ end
 ```
 
 | Dependency | Purpose |
-|---|---|
+| --- | --- |
 | `libcluster` | Automatic cluster formation using pluggable strategies (EPMD, DNS, gossip). Replaces the simpler `dns_cluster` — used here with the `Cluster.Strategy.Epmd` strategy. |
 | `phoenix_pubsub` | In-process pub/sub for broadcasting state changes to LiveViews. |
 | `durable_server` | GenServer wrapper that persists state to an EKV backend. Handles `dump_state`, `load_state`, versioning (`vsn`), `permanent: true`, and `auto_sync: true`. |
 | `ekv` | Embedded key-value store backed by SQLite. Supports sharding, observer mode for replicas, and region-based routing. |
+
+The core has **no transport dependencies** (no `grpc`, `protobuf`, `amqp`). Those belong to the adapter apps.
+
+### 2.1.1 gRPC adapter (`apps/svmm_grpc/mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:svmm, in_umbrella: true},
+    # Shared wire contract (generated protobuf + CloudEvents helpers).
+    # Local path until published; then:
+    #   {:svmm_proto, github: "propedeutica/svmm-proto", sparse: "elixir", tag: "vX.Y.Z"}
+    {:svmm_proto, path: "../../../svmm-proto/elixir"},
+    {:grpc_server, "~> 1.1"}
+  ]
+end
+```
+
+`protobuf`, `grpc` and `gun` come in transitively through `svmm_proto`.
+
+`svmm_grpc` depends on `svmm`; `svmm` must never depend on `svmm_grpc`.
 
 ### 2.2 Web app (`apps/svmm_web/mix.exs`)
 
@@ -58,7 +80,7 @@ defp deps do
     {:phoenix_live_reload, "~> 1.2", only: :dev},
     {:phoenix_live_view, "~> 1.2.0"},
     {:lazy_html, ">= 0.1.0", only: :test},
-    {:phoenix_live_dashboard, "~> 0.8.3"},
+    {:phoenix_live_dashboard, "~> 0.9"},
     {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},
     {:tailwind, "~> 0.3", runtime: Mix.env() == :dev},
     {:heroicons,
@@ -236,7 +258,7 @@ The file is the lowest-priority source so that an operator can override any valu
 ### Environment variables reference
 
 | Variable | Required | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `NODE_ROLE` | No | `primary` | `primary` or `replica` |
 | `NODE_NAME` | Yes (for clustering) | `nil` | Full Erlang node name, e.g. `primary@10.0.0.1` |
 | `ERLANG_COOKIE` | No | VM default | Shared cookie for all nodes. Dev scripts default to `svmm_dev`. |
@@ -245,6 +267,9 @@ The file is the lowest-priority source so that an operator can override any valu
 | `CLUSTER_SIZE` | No | `1` | Number of EKV cluster members |
 | `EKV_SHARDS` | No | `2` | Number of EKV SQLite shards |
 | `PORT` | No | `4000` | HTTP port for Phoenix |
+| `GRPC_ENABLED` | No | `true` | Set to `false`/`0`/`no` to disable the agent gRPC listener (read by `svmm_grpc`) |
+| `GRPC_PORT` | No | `50051` | Port of the agent gRPC listener (primary only) |
+| `EKV_STALE_STARTUP` | No | — | `trust` or `wipe`. Operator decision for a primary with `CLUSTER_SIZE>1` whose EKV data is stale at boot (§10.3). Set for **one** start, then remove. Ignored on replicas and single-member primaries. |
 | `SECRET_KEY_BASE` | Yes in prod | — | Phoenix secret key base |
 | `PHX_HOST` | No in prod | `DNS_CLUSTER_QUERY` | Public hostname for URL generation |
 
@@ -309,6 +334,8 @@ def children_for_role(config) do
   ] ++ role_children(role, config)
 end
 ```
+
+Common children also include `Svmm.Agents.Registry` (agent liveness). The gRPC listener and command dispatcher are **not** started here: they are supervised by `SvmmGrpc.Application` (section 21.4), so a transport failure cannot restart the core tree.
 
 **Primary children:**
 
@@ -549,7 +576,7 @@ end
 ### Key callbacks
 
 | Callback | Purpose |
-|---|---|
+| --- | --- |
 | `dump_state(state)` | Returns the subset of state to persist. Exclude transient data (session counters, connection state, heartbeats). |
 | `init(state)` | Receives persisted state (or `initial_state`). Merge with transient defaults and return `{:ok, state, opts}`. |
 | `load_state(old_vsn, state)` | Migrate state from older `vsn` values. |
@@ -602,6 +629,7 @@ Svmm.Hosts.add_host(hostname)   # -> :ok  (cast, async)
 Svmm.Supervisor (one_for_one)
   +-- Cluster.Supervisor (name: Svmm.ClusterSupervisor)
   +-- Phoenix.PubSub (name: Svmm.PubSub)
+  +-- Svmm.Agents.Registry
   +-- EKV (name: :svmm_cluster, mode: member)
   +-- DurableServer.Supervisor (name: Svmm.DurableServer.Supervisor)
       +-- Svmm.Hosts  [started via start_primary_services/0]
@@ -609,6 +637,10 @@ Svmm.Supervisor (one_for_one)
 SvmmWeb.Supervisor (one_for_one)
   +-- SvmmWeb.Telemetry
   +-- SvmmWeb.Endpoint
+
+SvmmGrpc.Supervisor (one_for_one)          [independent of Svmm.Supervisor]
+  +-- Svmm.Grpc.CommandDispatcher
+  +-- GRPC.Server.Supervisor (Svmm.Grpc.Endpoint)   [primary only, GRPC_ENABLED]
 ```
 
 ### Replica node
@@ -617,10 +649,14 @@ SvmmWeb.Supervisor (one_for_one)
 Svmm.Supervisor (one_for_one)
   +-- Cluster.Supervisor (name: Svmm.ClusterSupervisor)
   +-- Phoenix.PubSub (name: Svmm.PubSub)
+  +-- Svmm.Agents.Registry
   +-- EKV (name: :svmm_cluster, mode: observer)
 
 SvmmWeb.Supervisor (one_for_one)
   [empty — no endpoint on replicas]
+
+SvmmGrpc.Supervisor (one_for_one)
+  +-- Svmm.Grpc.CommandDispatcher               [no listener on replicas]
 ```
 
 ### How clustering works
@@ -639,11 +675,62 @@ Consequences:
 
 - Replicas are cold standbys: headless, read-only EKV observers. Their only job is to keep a current copy of the state.
 - Promotion is a restart with a different role. No data movement is needed because the replica's EKV directory already has the data.
-- The operator is responsible for making sure the old primary is really down before promoting. `verify_no_existing_primary/1` is a safety net for that: it refuses to boot a second primary if one is reachable over Erlang distribution. It cannot detect a primary that is alive but partitioned away, and that case is left to the operator.
+- The operator is solely responsible for making sure the old primary is really down before promoting. SVMM does not try to detect a primary that is alive but partitioned away.
+- **Floating IP check (planned, replaces the current ping-based `verify_no_existing_primary/1`).** The check only matters when a floating IP is configured (`FLOATING_IP`); without one, the change of master is entirely manual and no check runs. On boot with a floating IP, the primary:
+  1. verifies the floating IP is assigned to one of its own interfaces, and refuses to start if it is not;
+  2. checks that no other manager answers on that IP (for example a second cluster in the same network). Note that a TCP connection cannot detect this once the IP is local, because the connection would reach the node itself. It needs a layer-2 duplicate-address check (for example `arping -D`), which requires the `arping` tool and raw-socket permission. Whether EKV also refuses to start in that situation is unverified: EKV members discover each other through connected Erlang nodes, so the outcome depends on the cookie and node names. This needs a test.
+  Any failure aborts the start.
+- **No floating IP:** the new master tells the agents that the address changed (see `docs/agent-spec.md`, `redirect` event). This is only possible while the old master is still connected to the agents (a planned move). If the old master is already dead, agents find the new master through the endpoint list they already hold.
 - The old primary must not be restarted as a primary after a promotion. Bring it back as a replica.
 - Anything that depends on a replica being current (promotion runbook, UI) should show how fresh the copy is, because the operator decides based on it. This is not built yet.
 
 The "relinquish the lead on quorum loss" wording in the parent `ARCHITECTURE.md` (§5) and the quorum/leader-election items in the root `AGENTS.md` do not apply to this model.
+
+### 10.2 Future: 3-node primary cluster
+
+The current model is one primary plus cold-standby replicas with manual promotion. A **3-node primary cluster** is planned for a later version and is **not designed yet**. This section records the intent so today's choices do not close the door.
+
+- Three EKV voting members (`cluster_size: 3`) instead of one voter plus observers, so the data survives the loss of one node and CAS has a real quorum.
+- Coordination (which node runs the active manager) can then use EKV/DurableServer CAS instead of operator judgement. Whether the manual flow stays available alongside it is undecided.
+- Agent endpoint lists (see `docs/agent-spec.md` §4) would contain the cluster members.
+- Items that today assume a single primary and will need revisiting: the boot-time `verify_no_existing_primary/1` check, the primary record in EKV, `cluster_size` defaults, and the promotion runbook.
+- Today a primary started with `CLUSTER_SIZE=3` and no other members up fails at boot even with an empty data dir: `DurableServer.LifecycleManager` cannot write its node heartbeat without a quorum (`:heartbeat_deadline_exceeded`). This is expected until the 3-node design exists.
+
+Until then, every feature should keep working with exactly one primary, and avoid assumptions that would make a third voting member impossible (for example hard-coded `primary@<IP>` node names).
+
+### 10.3 Stale data at startup (`Svmm.StaleStartup`)
+
+EKV stores when a node was last active. If that is older than `tombstone_ttl`
+(7 days), EKV refuses to start: other members may have purged the records of keys
+deleted in the meantime, so the old data could bring those keys back. A node that
+was off for more than a week (a stopped dev machine, a replica kept as a cold
+standby, a primary being promoted) hits this.
+
+`Svmm.Application` catches EKV's `{:stale_db, info}` start error, decides, and
+retries once:
+
+| Node | Decision | Why |
+| --- | --- | --- |
+| replica | **wipe** shard files (`shard_N.db`, `-wal`, `-shm` only) and resync from the primary | a replica never holds data the primary lacks |
+| primary, `CLUSTER_SIZE=1` | **trust** the data (`allow_stale_startup: true`) | it is the only voting copy; nobody else can have purged anything |
+| primary, `CLUSTER_SIZE>1`, `EKV_STALE_STARTUP=trust\|wipe` | as set | the operator already decided |
+| primary, `CLUSTER_SIZE>1`, started from a terminal | **prompt**: `t` trust, `w` wipe, anything else aborts (5 min timeout → abort) | only a person knows whether the other members are newer |
+| primary, `CLUSTER_SIZE>1`, no terminal (systemd) | **refuse to start**, with instructions to set `EKV_STALE_STARTUP` | never guess for the operator |
+
+Every case is visible twice:
+
+- **Console (stderr):** a framed `SVMM startup: stale EKV data` notice with the
+  age, the limit, the decision and why, and the list of deleted files.
+- **Log:** one line `EKV stale data at startup: decision=<trust|wipe|abort>
+  role=… cluster_size=… path=… reason=… age=… threshold=…` (warning; error for
+  abort), plus `EKV stale data: deleted N file(s): …` on a wipe.
+
+EKV logs its own `[error] … refusing stale database startup` just before this. That
+line is expected and is followed by the SVMM decision.
+
+Not covered: EKV's separate partition quarantine (`partition_ttl_policy`), which
+applies when a *running* node reconnects to a member that was gone longer than
+`tombstone_ttl`.
 
 ---
 
@@ -772,6 +859,7 @@ curl http://localhost:4002   # => HTTP 200
 ### Scenario B — Two machines
 
 `DNS_CLUSTER_QUERY` points to the primary's IP. Both machines must have TCP open on:
+
 - `4369` — epmd
 - `9100–9155` — Erlang distribution (configure via `ELIXIR_ERL_OPTIONS="-kernel inet_dist_listen_min 9100 inet_dist_listen_max 9155"`)
 
@@ -827,6 +915,7 @@ Cleans the EKV test directory and starts Erlang distribution before each test ru
 Tests `parse_string/1`, `node_role/1`, `node_name/1`, `cookie/1`, `ekv_data_dir/1`.
 
 Key cases:
+
 - Parses `KEY=value` pairs, skips blank lines and `#` comments
 - Splits on the first `=` only (preserves `secret=with=equals`)
 - Trims whitespace from keys and values
@@ -905,7 +994,7 @@ Replicas are always headless by design (`SvmmWeb.Application` starts no children
 ## 18. Version Reference
 
 | Component | Version |
-|---|---|
+| --- | --- |
 | Elixir | ~> 1.15 |
 | Phoenix | ~> 1.8.8 |
 | Phoenix LiveView | ~> 1.2.0 |
@@ -982,12 +1071,24 @@ end
 
 ---
 
-## 21. Agent Communication (transport-agnostic, WebSocket first)
+## 21. Agent Communication (transport-agnostic, gRPC first)
 
 SVMM talks to Go agents over a **transport-agnostic boundary** (ports & adapters).
-The default adapter is **Phoenix Channels over WebSocket** — no message broker
-required. A future **AMQP adapter** can be dropped in by config, without touching
-the domain or adding an `amqp` dependency to the core.
+The current adapter is **gRPC** (`apps/svmm_grpc`); the earlier plan of Phoenix
+Channels over WebSocket was dropped. A future **AMQP adapter** can be added the same
+way, without touching the domain or adding an `amqp` dependency to the core.
+
+The wire contract lives in its own repository, **`svmm-proto`**
+(`github.com/propedeutica/svmm-proto`), shared by this server and the Go agent
+**`svmm-agent`** (`github.com/propedeutica/svmm-agent`). Every message in both
+directions is a [CloudEvent](https://cloudevents.io/) in the protobuf format, sent on a
+single bidirectional RPC, `svmm.agent.v1.AgentService/Connect`. The message kind is the
+CloudEvent `type` and the payload is `proto_data`, so adding a message never changes the
+service. How to add one: `svmm-proto/docs/adding-a-message.md`.
+
+The previous contract (`proto/agent.proto` with unary `Register`, `StatusDiff`, …) and the
+`amqp-libvirt-bridge` agent that used it are **no longer compatible** with this server.
+Their features are re-added as CloudEvents one at a time.
 
 ### 21.1 Guiding principles
 
@@ -995,7 +1096,7 @@ the domain or adding an `amqp` dependency to the core.
   (web) nor `amqp`. It ships a behaviour + canonical structs; every transport is an
   adapter that depends *on* the core, never the reverse.
 - **Fire-and-forget is acceptable.** Commands and events may be lost on disconnect
-  (at-most-once). No durable queue is built on the WebSocket path.
+  (at-most-once). No durable queue is built on the gRPC path.
 - **Two symmetric pipelines.** The inbound (agent → state/UI) path and the outbound
   (intent → command → agent) path both cross the same transport boundary, so a new
   transport lights up both directions at once.
@@ -1006,19 +1107,24 @@ the domain or adding an `amqp` dependency to the core.
 ### 21.2 Tiers
 
 ```
-API tier         apps/svmm_web  — REST/JSON + GraphQL controllers, LiveView UI
-                      │ Svmm.Agents.command/2 (intent)        ▲ subscribes Svmm.PubSub
-DECISION tier    apps/svmm      — Svmm.Orchestrator, Svmm.Hosts/DurableServer (EKV)
+API tier         apps/svmm_web  — REST/JSON controllers, LiveView UI
+                      │ Svmm.Agents.command/3 (intent)        ▲ subscribes Svmm.PubSub
+DECISION tier    apps/svmm      — Svmm.Hosts/DurableServer (EKV), Svmm.Agents.Registry
                       │ Svmm.Agents.Transport (behaviour)     ▲ Svmm.Agents.Ingress
-EDGE/TRANSPORT   adapter apps   — WebSocket now (svmm_web); AMQP later (svmm_amqp)
-                      ▲ WSS/443                               ▲ AMQPS/5671 (future)
+EDGE/TRANSPORT   adapter apps   — gRPC now (svmm_grpc); AMQP later (svmm_amqp)
+                      ▲ gRPC (default :50051)                 ▲ AMQPS/5671 (future)
                                         Go agents
 ```
 
 Tiers are separate umbrella apps communicating through `Svmm.PubSub` and the
-transport behaviour, so the **API tier** and **decision tier** can later be split
-onto different libcluster nodes without code change (the role-aware
-`SvmmWeb.Application` is the seam).
+transport behaviour. Adapters depend on the core, never the reverse. Each adapter has
+its own supervision tree, so a crash, restart or hang in the transport cannot restart
+EKV, DurableServer or the registry.
+
+**Fail-fast rule.** The core never waits on the network. When no adapter is configured
+the default `Svmm.Agents.Transport.Noop` returns `{:error, :no_transport}` and reports
+no agent as connected. Agent liveness is judged from `last_seen` in
+`Svmm.Agents.Registry`, not from an open stream.
 
 ### 21.3 Core contracts (`apps/svmm`, no transport deps)
 
@@ -1073,6 +1179,7 @@ end
 ```
 
 Supporting core modules:
+
 - `Svmm.Agents` — context facade; `command(agent_id, action, params)` builds a
   `%Command{}` and calls `Transport.send_command/2`. Public API for the API tier and orchestrator.
 - `Svmm.Agents.Registry` — transport-agnostic agent liveness (who is connected /
@@ -1080,94 +1187,44 @@ Supporting core modules:
 - `Svmm.Orchestrator` — decision tier: consumes the `"agents"` PubSub topic, decides,
   emits commands through the port.
 
-### 21.4 WebSocket adapter (now, `apps/svmm_web`)
+### 21.4 gRPC adapter (now, `apps/svmm_grpc`)
 
-Endpoint socket:
+Modules (all under `apps/svmm_grpc/lib/svmm/grpc/`):
 
-```elixir
-socket "/agent/socket", SvmmWeb.AgentSocket,
-  websocket: [check_origin: false],
-  longpoll: false
-```
+| Module | Role |
+|---|---|
+| `Svmm.Grpc.AgentServer` | Implements `Connect`. The agent id is taken from the CloudEvent `source` (`svmm-agent/<id>`); events with any other source are dropped. Each known `type` is parsed with `SvmmProto.Events` and mapped to `%Event{}` for `Svmm.Agents.Ingress.handle/1`. Unknown types are logged and dropped. When the stream ends the agent is marked offline. |
+| `Svmm.Grpc.Endpoint` | `GRPC.Endpoint` that runs `AgentServer`. |
+| `Svmm.Grpc.CommandDispatcher` | GenServer holding the open streams per agent (monitored) and request/response correlation. Commands pushed to a stream are **dropped with a warning** until a command message exists in `svmm-proto`. |
+| `Svmm.Grpc.Transport` | Implements `Svmm.Agents.Transport` by delegating to the dispatcher. |
 
-Auth stays in `SvmmWeb.AgentSocket` (token via `Svmm.Auth.verify_agent_token/1`):
-
-```elixir
-defmodule SvmmWeb.AgentSocket do
-  use Phoenix.Socket
-  channel "host:*", SvmmWeb.AgentChannel
-
-  @impl true
-  def connect(%{"token" => token}, socket, _info) do
-    case Svmm.Auth.verify_agent_token(token) do
-      {:ok, agent_id} -> {:ok, assign(socket, :agent_id, agent_id)}
-      :error -> :error
-    end
-  end
-
-  @impl true
-  def id(socket), do: "agent_socket:#{socket.assigns.agent_id}"
-end
-```
-
-`SvmmWeb.AgentChannel` is **thin** — it only marshals JSON → `%Event{}` and delegates
-to the core funnel; no domain logic lives here:
-
-```elixir
-defmodule SvmmWeb.AgentChannel do
-  use Phoenix.Channel
-  alias Svmm.Agents.{Event, Ingress}
-
-  def join("host:" <> agent_id, _params, socket) do
-    {:ok, assign(socket, :agent_id, agent_id)}
-  end
-
-  def handle_in(kind, payload, socket) when kind in ~w(registration heartbeat status) do
-    Ingress.handle(%Event{
-      kind: String.to_existing_atom(kind),
-      agent_id: socket.assigns.agent_id,
-      payload: payload,
-      received_at: DateTime.utc_now()
-    })
-    {:noreply, socket}
-  end
-end
-```
-
-Outbound adapter implements the behaviour:
-
-```elixir
-# apps/svmm_web/lib/svmm_web/agent_transport.ex
-defmodule SvmmWeb.AgentTransport do
-  @behaviour Svmm.Agents.Transport
-
-  @impl true
-  def send_command(agent_id, %Svmm.Agents.Command{} = c),
-    do: SvmmWeb.Endpoint.broadcast("host:#{agent_id}", "command", to_wire(c))
-
-  @impl true
-  def connected?(agent_id), do: SvmmWeb.Presence.get_by_key("agents", agent_id) != []
-
-  defp to_wire(%{action: a, params: p}), do: %{action: Atom.to_string(a), params: p}
-end
-```
+`SvmmGrpc.Application` starts `CommandDispatcher` on every node and the
+`GRPC.Server.Supervisor` listener only on a primary with `GRPC_ENABLED` not false
+(port `GRPC_PORT`, default 50051). The child spec must include `start_server: true`;
+without it `grpc_server` starts but never binds the port.
 
 Wiring:
 
 ```elixir
 # config/config.exs
-config :svmm, :agent_transport, SvmmWeb.AgentTransport
+config :svmm, :agent_transport, Svmm.Grpc.Transport
 ```
 
-No extra supervisor child is needed on this path — Phoenix Channels are managed by
-`SvmmWeb.Endpoint`.
+If the adapter is not in the release, `:agent_transport` falls back to
+`Svmm.Agents.Transport.Noop`.
+
+Known gaps: `CommandDispatcher.send_command/3` is a synchronous `GenServer.call`, so a
+stuck dispatcher can block a caller; `grpc_port/1`, `grpc_enabled?/1` and the `GRPC_*`
+variable mapping still live in `Svmm.Config`; the gRPC listener has no authentication
+yet (see section 20).
 
 ### 21.5 AMQP adapter (future, `apps/svmm_amqp`)
 
 Delivered as a **separate umbrella app** so `apps/svmm` never gains an `amqp`
 dependency. It provides:
+
 - `Svmm.Amqp.Consumer` — a `Broadway`/`amqp` consumer that marshals AMQP messages →
-  `%Event{}` → `Svmm.Agents.Ingress.handle/1` (same funnel as WebSocket).
+  `%Event{}` → `Svmm.Agents.Ingress.handle/1` (same funnel as gRPC).
 - `Svmm.Amqp.Transport` — implements `Svmm.Agents.Transport`, publishing `%Command{}`
   to an exchange.
 
@@ -1190,24 +1247,25 @@ never imports `commanded`; the two systems meet only at this ACL, which can reus
 
 ### 21.7 Event reference
 
-| Direction | Event / `kind` | Key payload fields |
-|---|---|---|
-| Agent → SVMM | `registration` | `agent_id`, `connection_type` (`"system"` \| `"user"`), `user` (user mode only) |
-| Agent → SVMM | `heartbeat` | `agent_id`, `timestamp` |
-| Agent → SVMM | `status` | `agent_id`, `vms`, `networks`, `node` |
-| SVMM → Agent | `command` | `action` (`"start_vm"` \| `"stop_vm"` \| `"full_refresh"`), `params` |
+The authoritative list is the table in `svmm-proto/README.md`. Implemented today:
 
-See `amqp-libvirt-bridge/PROTOCOL.md` for full wire message formats including status
-diff structure.
+| CloudEvent `type` | Direction | Payload | Maps to `%Event{}` |
+| --- | --- | --- | --- |
+| `io.svmm.agent.heartbeat.v1` | agent → server | `svmm.agent.v1.Heartbeat` (`sent_at`, `agent_version`) | `kind: :heartbeat`, `payload: %{agent_version, sent_at}` |
+
+Still to be re-added from the old contract: registration (capabilities), status
+(VMs, networks, storage pools), commands to the agent and their responses, VM startup
+query, graceful disconnect.
 
 ### 21.8 Migration steps (each shippable)
 
-1. Add core contracts: `Command`, `Event`, `Transport` behaviour, `Ingress`,
-   `Registry`, `Agents` facade (pure extraction, no behaviour change).
-2. Refactor `AgentChannel` to marshal → `Ingress`; add `SvmmWeb.AgentTransport`;
-   wire config. WebSocket keeps working, now behind the port.
+1. ✅ Add core contracts: `Command`, `Event`, `Transport` behaviour, `Ingress`,
+   `Registry`, `Agents` facade.
+2. ✅ gRPC adapter behind the port, then extracted into its own app `svmm_grpc`
+   with the `Noop` default transport in the core. (The WebSocket channel path was
+   never built.)
 3. Introduce `Svmm.Orchestrator` (decision tier) consuming `"agents"` PubSub,
    emitting commands via the port.
-4. Add API-tier controllers calling `Svmm.Agents.command/2`.
+4. Add API-tier controllers calling `Svmm.Agents.command/3`.
 5. *(Future)* `apps/svmm_amqp` adapter — flip config to switch transports.
 6. *(Future)* `apps/svmm_integration` ACL for the external Commanded/AMQP system.

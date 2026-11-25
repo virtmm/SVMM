@@ -22,4 +22,5 @@ config :phoenix,
   sort_verified_routes_query_params: true
 
 config :svmm,
-  ekv_data_dir: Path.join(System.tmp_dir!(), "svmm_test_ekv")
+  ekv_data_dir: Path.join(System.tmp_dir!(), "svmm_test_ekv"),
+  grpc_enabled: false

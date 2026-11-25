@@ -94,6 +94,17 @@ defmodule Svmm.ClusterTest do
       assert EKV in child_modules
       refute DurableServer.Supervisor in child_modules
     end
+
+    test "EKV overrides reach the EKV child for both roles" do
+      for role <- ["primary", "replica"] do
+        children =
+          Svmm.Application.children_for_role(%{"NODE_ROLE" => role}, allow_stale_startup: true)
+
+        assert {EKV, opts} = Enum.find(children, &match?({EKV, _}, &1))
+        assert opts[:allow_stale_startup] == true
+        assert opts[:name] == :svmm_cluster
+      end
+    end
   end
 
   defp child_module({module, _opts}) when is_atom(module), do: module
