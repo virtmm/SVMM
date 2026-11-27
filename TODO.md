@@ -1,0 +1,6 @@
+- [ ] Show number of hosts, CPU, memory available on each host
+- [ ] Show Keepalive state
+- [ ] Show running VM CPU and memory
+- [ ] Show XML of the VM
+- [ ] Show networks and storage configured in KVM
+- [ ] Show network and storage configured in the VM

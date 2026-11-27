@@ -37,3 +37,8 @@ npm-debug.log
 
 # Ignore the data directory, which may contain large files or sensitive information.
 /data/
+
+
+# Ignore AI local files
+/.claude/
+/.openai/

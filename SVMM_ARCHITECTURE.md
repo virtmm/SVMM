@@ -49,7 +49,7 @@ end
 | `durable_server` | GenServer wrapper that persists state to an EKV backend. Handles `dump_state`, `load_state`, versioning (`vsn`), `permanent: true`, and `auto_sync: true`. |
 | `ekv` | Embedded key-value store backed by SQLite. Supports sharding, observer mode for replicas, and region-based routing. |
 
-The core has **no transport dependencies** (no `grpc`, `protobuf`, `amqp`). Those belong to the adapter apps.
+The core has **no transport dependencies** (no `grpc`, `protobuf`). Those belong to the adapter apps.
 
 ### 2.1.1 gRPC adapter (`apps/svmm_grpc/mix.exs`)
 
@@ -1075,8 +1075,8 @@ end
 
 SVMM talks to Go agents over a **transport-agnostic boundary** (ports & adapters).
 The current adapter is **gRPC** (`apps/svmm_grpc`); the earlier plan of Phoenix
-Channels over WebSocket was dropped. A future **AMQP adapter** can be added the same
-way, without touching the domain or adding an `amqp` dependency to the core.
+Channels over WebSocket was dropped, and so was AMQP: no message broker is used. Another
+transport can still be added as an adapter app, without touching the domain.
 
 The wire contract lives in its own repository, **`svmm-proto`**
 (`github.com/propedeutica/svmm-proto`), shared by this server and the Go agent
@@ -1086,21 +1086,21 @@ single bidirectional RPC, `svmm.agent.v1.AgentService/Connect`. The message kind
 CloudEvent `type` and the payload is `proto_data`, so adding a message never changes the
 service. How to add one: `svmm-proto/docs/adding-a-message.md`.
 
-The previous contract (`proto/agent.proto` with unary `Register`, `StatusDiff`, …) and the
-`amqp-libvirt-bridge` agent that used it are **no longer compatible** with this server.
+The previous contracts (`proto/agent.proto` with unary `Register`, `StatusDiff`, …, and the
+AMQP protocol of the `amqp-libvirt-bridge` agent) are **no longer compatible** with this server.
 Their features are re-added as CloudEvents one at a time.
 
 ### 21.1 Guiding principles
 
 - **Core owns contracts, not transports.** `apps/svmm` depends on neither Phoenix
-  (web) nor `amqp`. It ships a behaviour + canonical structs; every transport is an
+  (web) nor any transport library. It ships a behaviour + canonical structs; every transport is an
   adapter that depends *on* the core, never the reverse.
 - **Fire-and-forget is acceptable.** Commands and events may be lost on disconnect
   (at-most-once). No durable queue is built on the gRPC path.
 - **Two symmetric pipelines.** The inbound (agent → state/UI) path and the outbound
   (intent → command → agent) path both cross the same transport boundary, so a new
   transport lights up both directions at once.
-- **Independent of the external Commanded/AMQP system.** SVMM never imports
+- **Independent of the external Commanded system.** SVMM never imports
   `commanded`. Integration happens later through an anti-corruption layer in its own
   app that maps the external system's events onto `Svmm.Agents` intents.
 
@@ -1111,8 +1111,8 @@ API tier         apps/svmm_web  — REST/JSON controllers, LiveView UI
                       │ Svmm.Agents.command/3 (intent)        ▲ subscribes Svmm.PubSub
 DECISION tier    apps/svmm      — Svmm.Hosts/DurableServer (EKV), Svmm.Agents.Registry
                       │ Svmm.Agents.Transport (behaviour)     ▲ Svmm.Agents.Ingress
-EDGE/TRANSPORT   adapter apps   — gRPC now (svmm_grpc); AMQP later (svmm_amqp)
-                      ▲ gRPC (default :50051)                 ▲ AMQPS/5671 (future)
+EDGE/TRANSPORT   adapter apps   — gRPC (svmm_grpc)
+                      ▲ gRPC (default :50051)
                                         Go agents
 ```
 
@@ -1129,7 +1129,7 @@ no agent as connected. Agent liveness is judged from `last_seen` in
 ### 21.3 Core contracts (`apps/svmm`, no transport deps)
 
 Canonical structs — the internal representation, independent of any wire format.
-Every adapter marshals JSON/AMQP payloads to/from these; the domain never sees a
+Every adapter marshals its wire payloads to/from these; the domain never sees a
 wire format.
 
 ```elixir
@@ -1218,34 +1218,14 @@ stuck dispatcher can block a caller; `grpc_port/1`, `grpc_enabled?/1` and the `G
 variable mapping still live in `Svmm.Config`; the gRPC listener has no authentication
 yet (see section 20).
 
-### 21.5 AMQP adapter (future, `apps/svmm_amqp`)
+### 21.5 External Commanded integration (anti-corruption layer)
 
-Delivered as a **separate umbrella app** so `apps/svmm` never gains an `amqp`
-dependency. It provides:
-
-- `Svmm.Amqp.Consumer` — a `Broadway`/`amqp` consumer that marshals AMQP messages →
-  `%Event{}` → `Svmm.Agents.Ingress.handle/1` (same funnel as gRPC).
-- `Svmm.Amqp.Transport` — implements `Svmm.Agents.Transport`, publishing `%Command{}`
-  to an exchange.
-
-Switching transports is then: add the app to the umbrella and flip one line —
-
-```elixir
-config :svmm, :agent_transport, Svmm.Amqp.Transport
-```
-
-Liveness on the AMQP path is heartbeat/TTL based via `Svmm.Agents.Registry` (no
-`Presence`), keeping the domain unchanged.
-
-### 21.6 External Commanded/AMQP integration (anti-corruption layer)
-
-When integrating the external system that uses Commanded + AMQP, add
-`apps/svmm_integration`. It translates *their* Commanded events / AMQP messages onto
+When integrating the external system that uses Commanded, add
+`apps/svmm_integration`. It translates *their* Commanded events onto
 `Svmm.Agents.command/2` and reads SVMM's `"agents"` PubSub events back. SVMM core
-never imports `commanded`; the two systems meet only at this ACL, which can reuse the
-`apps/svmm_amqp` transport.
+never imports `commanded`; the two systems meet only at this ACL.
 
-### 21.7 Event reference
+### 21.6 Event reference
 
 The authoritative list is the table in `svmm-proto/README.md`. Implemented today:
 
@@ -1257,7 +1237,7 @@ Still to be re-added from the old contract: registration (capabilities), status
 (VMs, networks, storage pools), commands to the agent and their responses, VM startup
 query, graceful disconnect.
 
-### 21.8 Migration steps (each shippable)
+### 21.7 Migration steps (each shippable)
 
 1. ✅ Add core contracts: `Command`, `Event`, `Transport` behaviour, `Ingress`,
    `Registry`, `Agents` facade.
@@ -1267,5 +1247,4 @@ query, graceful disconnect.
 3. Introduce `Svmm.Orchestrator` (decision tier) consuming `"agents"` PubSub,
    emitting commands via the port.
 4. Add API-tier controllers calling `Svmm.Agents.command/3`.
-5. *(Future)* `apps/svmm_amqp` adapter — flip config to switch transports.
-6. *(Future)* `apps/svmm_integration` ACL for the external Commanded/AMQP system.
+5. *(Future)* `apps/svmm_integration` ACL for the external Commanded system.
